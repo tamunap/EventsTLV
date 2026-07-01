@@ -1,15 +1,32 @@
 """
 Tel Aviv Events API
 ====================
-A small backend service that aggregates public event data for Tel Aviv
-and exposes a filterable REST API (by single date or date range).
+A small backend service that fetches, filters (by date or date range),
+and bilingually returns public Tel Aviv events -- sourced directly from
+the Tel Aviv Municipality's own "Events in DigiTel" open dataset.
 
-Data source: data.gov.il -- Israel's national open data portal, which is
-CKAN-based (https://data.gov.il/api/3/action/...). It hosts a nationwide
-"events by district" dataset that includes Tel Aviv-Yafo. This is used
-instead of the Tel Aviv Municipality's own API portal because that one
-requires a manually-issued developer key (see README.md for details on
-adding it later as a second source).
+Data source: a stable, direct-download CSV published by the Tel Aviv
+Open Data portal (opendatasource.tel-aviv.gov.il), hosted on Azure Blob
+Storage:
+
+    https://saopendata.blob.core.windows.net/open-data-public-site/events_digitel.csv
+
+This is the *actual* municipal events feed (not a nationwide proxy), no
+API key required. It's a plain file, not a query endpoint, so this
+service downloads and re-parses it on a refresh interval (see
+CACHE_TTL_SECONDS below) rather than hitting it on every request -- the
+file is ~35-40MB.
+
+Known format (confirmed from a real sample of the file):
+    Encoding:  UTF-16 LE, with a leading BOM
+    Delimiter: semicolon (;)
+    Columns:   rn;dt_event;title;NeighborhoodName;merhav;URL
+      rn                row number
+      dt_event          event date, YYYY-MM-DD
+      title             event title (Hebrew)
+      NeighborhoodName  neighborhood (Hebrew)
+      merhav            city area/district (Hebrew)
+      URL               link to the full event page on tel-aviv.gov.il
 
 Run:
     pip install -r requirements.txt
@@ -26,6 +43,10 @@ Query params:
     lang         "he" | "en" | "both" (default "both")
 """
 
+import csv
+import io
+import os
+import time
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
 
@@ -35,107 +56,78 @@ from pydantic import BaseModel
 
 from translator import to_english
 
-CKAN_BASE = "https://data.gov.il/api/3/action"
+CSV_URL = "https://saopendata.blob.core.windows.net/open-data-public-site/events_digitel.csv"
 
-# The dataset's CKAN "package" slug (stable) -- resource_id underneath it
-# can be regenerated when the file is refreshed, so we look that part up
-# dynamically instead of hardcoding it.
-PACKAGE_ID = "eventsdistrict"  # "Events by district" (אירועים לפי מחוז)
+# The file is large (~35-40MB); don't re-download/re-parse on every request.
+# Refresh at most this often. Override with an env var if you want a
+# different cadence.
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 30 * 60))  # 30 min
 
-CITY_FILTER = "תל אביב"
+app = FastAPI(title="Tel Aviv Events API", version="2.0.0")
 
-app = FastAPI(title="Tel Aviv Events API", version="1.0.0")
-
-_resource_id_cache: Optional[str] = None
-
-
-def _get_resource_id() -> str:
-    """Resolve the current datastore resource_id for the events package."""
-    global _resource_id_cache
-    if _resource_id_cache:
-        return _resource_id_cache
-
-    resp = requests.get(f"{CKAN_BASE}/package_show", params={"id": PACKAGE_ID}, timeout=15)
-    resp.raise_for_status()
-    payload = resp.json()
-
-    if not payload.get("success"):
-        raise RuntimeError(f"CKAN package_show failed: {payload}")
-
-    resources = payload["result"]["resources"]
-    if not resources:
-        raise RuntimeError("No resources found under the events dataset")
-
-    for r in resources:
-        if r.get("datastore_active"):
-            _resource_id_cache = r["id"]
-            return _resource_id_cache
-
-    # Fall back to the first listed resource if none is flagged datastore-active
-    _resource_id_cache = resources[0]["id"]
-    return _resource_id_cache
+_cache: Dict[str, Any] = {"records": None, "fetched_at": 0.0}
 
 
 class Event(BaseModel):
     title_he: str
     title_en: Optional[str] = None
-    description_he: Optional[str] = None
-    description_en: Optional[str] = None
     date_start: Optional[str] = None
-    date_end: Optional[str] = None
-    neighborhood: Optional[str] = None
-    location: Optional[str] = None
-    raw: Dict[str, Any]  # full original record, for fields we didn't map
+    neighborhood_he: Optional[str] = None
+    neighborhood_en: Optional[str] = None
+    area_he: Optional[str] = None
+    area_en: Optional[str] = None
+    url: Optional[str] = None
+    raw: Dict[str, Any]  # full original record, for anything we didn't map
 
 
-def _fetch_raw_records(limit: int = 1000) -> List[Dict[str, Any]]:
-    resource_id = _get_resource_id()
-    params = {
-        "resource_id": resource_id,
-        "q": CITY_FILTER,
-        "limit": limit,
-    }
-    resp = requests.get(f"{CKAN_BASE}/datastore_search", params=params, timeout=20)
+def _fetch_raw_records(force: bool = False) -> List[Dict[str, Any]]:
+    """Download + parse the CSV, using an in-memory cache to avoid
+    re-fetching a ~35-40MB file on every request."""
+    now = time.time()
+    if (
+        not force
+        and _cache["records"] is not None
+        and (now - _cache["fetched_at"]) < CACHE_TTL_SECONDS
+    ):
+        return _cache["records"]
+
+    resp = requests.get(CSV_URL, timeout=60)
     resp.raise_for_status()
-    payload = resp.json()
-    if not payload.get("success"):
-        raise RuntimeError(f"CKAN datastore_search failed: {payload}")
-    return payload["result"]["records"]
 
+    # Confirmed encoding: UTF-16 LE with a BOM.
+    text = resp.content.decode("utf-16-le")
+    text = text.lstrip("\ufeff")
 
-def _first_present(record: Dict[str, Any], *keys: str) -> Optional[str]:
-    for k in keys:
-        if record.get(k):
-            return record[k]
-    return None
+    reader = csv.DictReader(io.StringIO(text), delimiter=";")
+    records = list(reader)
+
+    _cache["records"] = records
+    _cache["fetched_at"] = now
+    return records
 
 
 def _normalize(record: Dict[str, Any], lang: str) -> Event:
-    # NOTE: Hebrew column names in this dataset can vary slightly between
-    # refreshes. Run inspect_schema.py once to print real field names for
-    # your current snapshot, then adjust the key lists below if nothing
-    # is coming through.
-    title_he = _first_present(record, "שם_אירוע", "שם האירוע", "event_name", "שם") or ""
-    desc_he = _first_present(record, "תיאור", "תיאור_אירוע", "description")
-    date_start = _first_present(record, "תאריך_התחלה", "תאריך", "start_date", "מתאריך")
-    date_end = _first_present(record, "תאריך_סיום", "עד_תאריך", "end_date")
-    neighborhood = _first_present(record, "שכונה", "אזור", "neighborhood")
-    location = _first_present(record, "מיקום", "כתובת", "location")
+    title_he = (record.get("title") or "").strip()
+    date_start = (record.get("dt_event") or "").strip() or None
+    neighborhood_he = (record.get("NeighborhoodName") or "").strip() or None
+    area_he = (record.get("merhav") or "").strip() or None
+    url = (record.get("URL") or "").strip() or None
 
-    title_en = desc_en = None
+    title_en = neighborhood_en = area_en = None
     if lang in ("en", "both"):
         title_en = to_english(title_he) if title_he else None
-        desc_en = to_english(desc_he) if desc_he else None
+        neighborhood_en = to_english(neighborhood_he) if neighborhood_he else None
+        area_en = to_english(area_he) if area_he else None
 
     return Event(
         title_he=title_he,
         title_en=title_en,
-        description_he=desc_he,
-        description_en=desc_en,
         date_start=date_start,
-        date_end=date_end,
-        neighborhood=neighborhood,
-        location=location,
+        neighborhood_he=neighborhood_he,
+        neighborhood_en=neighborhood_en,
+        area_he=area_he,
+        area_en=area_en,
+        url=url,
         raw=record,
     )
 
@@ -155,6 +147,7 @@ def get_events(
     end: Optional[str] = Query(None, description="End date, YYYY-MM-DD (inclusive)"),
     date_: Optional[str] = Query(None, alias="date", description="Single date, YYYY-MM-DD"),
     lang: str = Query("both", pattern="^(he|en|both)$"),
+    refresh: bool = Query(False, description="Force a re-download of the source CSV"),
 ):
     """Return Tel Aviv events, optionally filtered to a date or date range."""
     if date_:
@@ -167,29 +160,30 @@ def get_events(
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        raw_records = _fetch_raw_records()
+        raw_records = _fetch_raw_records(force=refresh)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream data source error: {e}")
 
-    events = [_normalize(r, lang) for r in raw_records]
-
+    # Filter by date first (on the raw dt_event string) -- cheaper than
+    # translating events we're going to throw away anyway.
     if start_d or end_d:
-        filtered = []
-        for ev in events:
-            if not ev.date_start:
+        filtered_raw = []
+        for r in raw_records:
+            raw_date = (r.get("dt_event") or "").strip()
+            if not raw_date:
                 continue
             try:
-                ev_date = _parse_date(ev.date_start)
+                ev_date = _parse_date(raw_date)
             except ValueError:
                 continue
             if start_d and ev_date < start_d:
                 continue
             if end_d and ev_date > end_d:
                 continue
-            filtered.append(ev)
-        events = filtered
+            filtered_raw.append(r)
+        raw_records = filtered_raw
 
-    return events
+    return [_normalize(r, lang) for r in raw_records]
 
 
 @app.get("/")
@@ -199,6 +193,9 @@ def root():
         "usage": [
             "GET /events?start=YYYY-MM-DD&end=YYYY-MM-DD&lang=both",
             "GET /events?date=YYYY-MM-DD",
+            "GET /events?...&refresh=true   (force re-download of the source file)",
         ],
-        "source": "data.gov.il (CKAN) -- dataset: events by district",
+        "source": "Tel Aviv Municipality -- 'Events in DigiTel' open dataset",
+        "source_url": CSV_URL,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
     }
