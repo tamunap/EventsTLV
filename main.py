@@ -52,6 +52,7 @@ from typing import Optional, List, Dict, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from translator import to_english
@@ -64,6 +65,16 @@ CSV_URL = "https://saopendata.blob.core.windows.net/open-data-public-site/events
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 30 * 60))  # 30 min
 
 app = FastAPI(title="Tel Aviv Events API", version="2.0.0")
+
+# Allow browser-based frontends (e.g. a Google AI Studio app, or any site)
+# to call this API directly. Wide open ("*") since this only serves public
+# read-only event data -- nothing sensitive to protect here.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 _cache: Dict[str, Any] = {"records": None, "fetched_at": 0.0}
 
