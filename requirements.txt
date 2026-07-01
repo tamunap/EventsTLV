@@ -3,3 +3,4 @@ uvicorn[standard]>=0.29
 requests>=2.31
 pydantic>=2.6
 deep-translator>=1.11
+# no other deps needed -- CSV parsing uses Python's built-in csv module
